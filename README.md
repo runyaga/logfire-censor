@@ -110,10 +110,10 @@ Get your tokens:
                                       └───────────────────┘
 ```
 
-**Phase 1:** Run LLM query WITHOUT scrubbing → capture network traffic
-**Phase 2:** Run LLM query WITH scrubbing → capture network traffic
-**Phase 3:** Analyze mitmproxy captures for test string
-**Phase 4:** Query Logfire API to verify scrubbing in stored data
+- **Phase 1:** Run LLM query WITHOUT scrubbing → capture network traffic
+- **Phase 2:** Run LLM query WITH scrubbing → capture network traffic
+- **Phase 3:** Analyze mitmproxy captures for test string
+- **Phase 4:** Query Logfire API to verify scrubbing in stored data
 
 ## Scrubbing Configuration
 
