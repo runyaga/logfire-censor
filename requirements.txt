@@ -2,3 +2,4 @@ pydantic-ai[logfire]
 logfire
 python-dotenv
 mitmproxy
+certifi

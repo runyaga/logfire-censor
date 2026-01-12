@@ -50,8 +50,36 @@ setup_output_dir() {
     rm -f "$OUTPUT_DIR/BEFORE.md" "$OUTPUT_DIR/AFTER.md"
 }
 
+generate_mitmproxy_ca() {
+    if [ -f "$MITMPROXY_CA" ]; then
+        return 0
+    fi
+
+    echo_info "Generating mitmproxy CA certificate (first run)..."
+
+    # Start mitmdump briefly to generate the CA certificate
+    mitmdump -p "$PROXY_PORT" --set flow_detail=0 -q &
+    local temp_pid=$!
+    sleep 2
+
+    # Kill the temporary process
+    kill "$temp_pid" 2>/dev/null || true
+    wait "$temp_pid" 2>/dev/null || true
+
+    if [ -f "$MITMPROXY_CA" ]; then
+        echo_pass "mitmproxy CA certificate generated at $MITMPROXY_CA"
+    else
+        echo_fail "Failed to generate mitmproxy CA certificate"
+        exit 1
+    fi
+}
+
 setup_ca_bundle() {
     echo_info "Setting up SSL certificates..."
+
+    # Auto-generate mitmproxy CA if needed
+    generate_mitmproxy_ca
+
     SYSTEM_CA=$(python3 -c "import certifi; print(certifi.where())" 2>/dev/null || echo "/etc/ssl/cert.pem")
 
     if [ ! -f "$SYSTEM_CA" ]; then
@@ -59,12 +87,14 @@ setup_ca_bundle() {
         exit 1
     fi
 
-    if [ ! -f "$MITMPROXY_CA" ]; then
-        echo_fail "mitmproxy CA not found. Run 'mitmdump' once to generate it."
-        exit 1
-    fi
-
-    cat "$SYSTEM_CA" "$MITMPROXY_CA" > "$COMBINED_CA"
+    # Cross-platform file concatenation using Python
+    python3 -c "
+import sys
+with open('$COMBINED_CA', 'wb') as out:
+    for f in ['$SYSTEM_CA', '$MITMPROXY_CA']:
+        with open(f, 'rb') as inp:
+            out.write(inp.read())
+"
 }
 
 check_deps() {
@@ -73,7 +103,7 @@ check_deps() {
     local missing=0
 
     if ! command -v mitmdump &> /dev/null; then
-        echo_fail "mitmdump not found. Install: brew install mitmproxy"
+        echo_fail "mitmdump not found. Ensure venv is active ('source venv/bin/activate') or install mitmproxy."
         missing=1
     fi
 
@@ -94,6 +124,47 @@ check_deps() {
     fi
 
     echo_pass "All dependencies found"
+}
+
+check_env() {
+    echo_info "Checking environment variables..."
+
+    local missing=0
+
+    # Source .env file if it exists
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        set -a
+        source "$SCRIPT_DIR/.env"
+        set +a
+    fi
+
+    if [ -z "$LOGFIRE_TOKEN" ]; then
+        echo_fail "LOGFIRE_TOKEN not set in .env"
+        missing=1
+    fi
+
+    if [ -z "$GOOGLE_API_KEY" ]; then
+        echo_fail "GOOGLE_API_KEY not set in .env"
+        missing=1
+    fi
+
+    if [ -z "$LOGFIRE_READ_TOKEN" ]; then
+        echo_fail "LOGFIRE_READ_TOKEN not set in .env (required for API validation)"
+        missing=1
+    fi
+
+    if [ "$missing" -eq 1 ]; then
+        echo ""
+        echo "Copy .env.example to .env and fill in your tokens:"
+        echo "  cp .env.example .env"
+        echo ""
+        echo "Get tokens from:"
+        echo "  - Logfire: https://logfire.pydantic.dev → Project Settings → Tokens"
+        echo "  - Google: https://aistudio.google.com/apikey"
+        exit 1
+    fi
+
+    echo_pass "All environment variables set"
 }
 
 start_proxy() {
@@ -149,6 +220,7 @@ main() {
     echo ""
 
     check_deps
+    check_env
     setup_output_dir
     setup_ca_bundle
 
@@ -193,6 +265,26 @@ main() {
     echo ""
     generate_reports
 
+    # Phase 4: Logfire API Validation
+    echo ""
+    echo -e "${BOLD}--- Phase 4: Validate via Logfire API ---${NC}"
+    echo ""
+
+    LOGFIRE_BASELINE_OK=0
+    LOGFIRE_SCRUB_OK=0
+
+    echo "[Test 3] Logfire API: expect test string in baseline spans"
+    if python3 validate_logfire.py --expect-found --minutes 10 --retry 3; then
+        LOGFIRE_BASELINE_OK=1
+    fi
+
+    echo ""
+    echo "[Test 4] Logfire API: expect NO test string in scrubbed spans"
+    echo_info "Note: Scrubbed spans should have content hidden"
+    if python3 validate_logfire.py --expect-not-found --minutes 10 --retry 3; then
+        LOGFIRE_SCRUB_OK=1
+    fi
+
     # Results
     echo ""
     echo -e "${BOLD}=============================================="
@@ -200,13 +292,21 @@ main() {
     echo -e "==============================================${NC}"
     echo ""
 
-    if [ "$BASELINE_OK" -eq 1 ] && [ "$SCRUB_OK" -eq 1 ]; then
+    echo "Network Traffic Analysis (mitmproxy):"
+    [ "$BASELINE_OK" -eq 1 ] && echo_pass "  Baseline: test string FOUND in traffic" || echo_fail "  Baseline: test string NOT found"
+    [ "$SCRUB_OK" -eq 1 ] && echo_pass "  Scrubbed: test string NOT in traffic" || echo_fail "  Scrubbed: test string FOUND (should be hidden)"
+
+    echo ""
+    echo "Logfire API Validation:"
+    [ "$LOGFIRE_BASELINE_OK" -eq 1 ] && echo_pass "  Baseline: test string FOUND in Logfire" || echo_fail "  Baseline: test string NOT found in Logfire"
+    [ "$LOGFIRE_SCRUB_OK" -eq 1 ] && echo_pass "  Scrubbed: test string NOT in Logfire" || echo_fail "  Scrubbed: test string FOUND in Logfire (should be hidden)"
+
+    echo ""
+
+    if [ "$BASELINE_OK" -eq 1 ] && [ "$SCRUB_OK" -eq 1 ] && [ "$LOGFIRE_BASELINE_OK" -eq 1 ] && [ "$LOGFIRE_SCRUB_OK" -eq 1 ]; then
         echo_pass "ALL TESTS PASSED"
         echo ""
-        echo "  Baseline: Prompt/response FOUND in telemetry (as expected)"
-        echo "  Scrubbed: Prompt/response NOT found in telemetry (as expected)"
-        echo ""
-        echo "  View results:"
+        echo "  View reports:"
         echo "    - output/BEFORE.md  (traffic without scrubbing)"
         echo "    - output/AFTER.md   (traffic with scrubbing)"
         echo ""
@@ -214,8 +314,11 @@ main() {
         exit 0
     else
         echo_fail "SOME TESTS FAILED"
-        [ "$BASELINE_OK" -eq 0 ] && echo "  - Baseline: expected to find test string"
-        [ "$SCRUB_OK" -eq 0 ] && echo "  - Scrubbed: test string should NOT be found"
+        echo ""
+        [ "$BASELINE_OK" -eq 0 ] && echo "  - Network: expected to find test string in baseline traffic"
+        [ "$SCRUB_OK" -eq 0 ] && echo "  - Network: test string should NOT be in scrubbed traffic"
+        [ "$LOGFIRE_BASELINE_OK" -eq 0 ] && echo "  - Logfire: expected to find test string in baseline spans"
+        [ "$LOGFIRE_SCRUB_OK" -eq 0 ] && echo "  - Logfire: test string should NOT be in scrubbed spans"
         exit 1
     fi
 }
