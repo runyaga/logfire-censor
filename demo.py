@@ -30,7 +30,9 @@ TEST_PROMPT = "In 2 sentences what is the Bill of Rights?"
 
 def configure_logfire(mode: str) -> None:
     """Configure logfire based on the scrubbing mode."""
-    if mode == "scrub":
+    scrubbing_enabled = mode == "scrub"
+
+    if scrubbing_enabled:
         # Enable aggressive scrubbing - pattern ".*" matches everything
         logfire.configure(
             send_to_logfire="if-token-present",
@@ -46,6 +48,10 @@ def configure_logfire(mode: str) -> None:
         logfire.instrument_pydantic_ai(include_content=True)
         print("[NO-SCRUB MODE] Logfire configured without scrubbing")
 
+    # Log a span showing scrubbing configuration
+    with logfire.span("scrubbing configured", scrubbing_enabled=scrubbing_enabled, mode=mode):
+        logfire.info("will scrub content" if scrubbing_enabled else "content will pass through")
+
 
 def run_llm_query() -> str:
     """Run a query against Gemini using pydantic-ai."""
@@ -57,8 +63,20 @@ def run_llm_query() -> str:
 
     print(f"Sending prompt: {TEST_PROMPT}")
 
-    # Run the query synchronously
-    result = agent.run_sync(TEST_PROMPT)
+    with logfire.span("llm query", prompt_length=len(TEST_PROMPT)):
+        # Check for sensitive content (demonstration)
+        has_sensitive_words = any(
+            word in TEST_PROMPT.lower()
+            for word in ["bill", "rights", "constitution"]
+        )
+        with logfire.span("content check", has_sensitive_words=has_sensitive_words):
+            if has_sensitive_words:
+                logfire.info("prompt has sensitive words")
+            else:
+                logfire.info("prompt appears safe")
+
+        # Run the query synchronously
+        result = agent.run_sync(TEST_PROMPT)
 
     print(f"Response: {result.output}")
     return result.output
